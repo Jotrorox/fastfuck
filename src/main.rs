@@ -266,7 +266,13 @@ extern "C" fn bf_putchar(c: u8) {
 }
 
 extern "C" fn bf_getchar() -> u8 {
-    io::stdin().bytes().next().unwrap_or(Ok(0)).unwrap_or(0)
+    let stdin = io::stdin();
+    let mut reader = io::BufReader::new(stdin.lock());
+    let mut buf = [0u8; 1];
+    reader
+        .read(&mut buf)
+        .map(|n| if n > 0 { buf[0] } else { 0 })
+        .unwrap_or(0)
 }
 
 fn run_jit(ops: &[Op]) {
@@ -489,7 +495,12 @@ fn run_jit(ops: &[Op]) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: fastfuck <file>");
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("error: no input file provided");
+        eprintln!("usage: fastfuck <file>");
+        std::process::exit(1);
+    });
+
     let source = {
         let file = File::open(&path).unwrap();
         let mut reader = BufReader::new(file);
