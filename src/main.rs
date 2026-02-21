@@ -494,21 +494,217 @@ fn run_jit(ops: &[Op]) {
     run_fn(tape.as_mut_ptr());
 }
 
+fn check_brackets(source: &[u8]) -> bool {
+    let mut stack: Vec<usize> = Vec::new();
+    let mut ok = true;
+
+    for (i, &b) in source.iter().enumerate() {
+        match b {
+            b'[' => stack.push(i),
+            b']' => {
+                if stack.pop().is_none() {
+                    eprintln!("  [brackets] ERROR: unmatched ']' at byte offset {}", i);
+                    ok = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    for pos in stack {
+        eprintln!("  [brackets] ERROR: unmatched '[' at byte offset {}", pos);
+        ok = false;
+    }
+    if ok {
+        println!("  [brackets]    OK  — all brackets are balanced.");
+    }
+    ok
+}
+
+fn check_unreachable(ops: &[Op]) {
+    let mut found = 0usize;
+
+    for i in 1..ops.len() {
+        let prev_zeroes_cell = matches!(
+            &ops[i - 1],
+            Op::JumpBack(_) | Op::Clear(_) | Op::MulLoop { .. }
+        );
+        if prev_zeroes_cell {
+            if let Op::JumpForward(_) = &ops[i] {
+                eprintln!(
+                    "  [unreachable] WARNING: loop at op-index {} is unreachable \
+                     (current cell is guaranteed 0 after op-index {})",
+                    i,
+                    i - 1
+                );
+                found += 1;
+            }
+        }
+    }
+
+    if found == 0 {
+        println!("  [unreachable] OK  — no unreachable loops detected.");
+    }
+}
+
+fn check_bounds(ops: &[Op]) {
+    type Range = Option<(i64, i64)>;
+
+    fn union(a: Range, b: Range) -> Range {
+        match (a, b) {
+            (Some((al, ah)), Some((bl, bh))) => Some((al.min(bl), ah.max(bh))),
+            _ => None,
+        }
+    }
+
+    fn shift(r: Range, delta: i64) -> Range {
+        r.map(|(lo, hi)| (lo + delta, hi + delta))
+    }
+
+    fn access(r: Range, off: i64, warnings: &mut Vec<String>) {
+        if let Some((lo, hi)) = r {
+            let alo = lo + off;
+            let ahi = hi + off;
+            if alo < 0 {
+                warnings.push(format!(
+                    "pointer+offset may underflow (minimum effective address: {}); \
+                     access will wrap around the tape",
+                    alo
+                ));
+            }
+            if ahi >= TAPE_SIZE as i64 {
+                warnings.push(format!(
+                    "pointer+offset may overflow tape size {} \
+                     (maximum effective address: {}); \
+                     access will wrap around the tape",
+                    TAPE_SIZE, ahi
+                ));
+            }
+        }
+    }
+
+    let mut pos: Range = Some((0, 0));
+    let mut warnings: Vec<String> = Vec::new();
+
+    let mut loop_entry: Vec<(usize, Range)> = Vec::new();
+
+    for (pc, op) in ops.iter().enumerate() {
+        match op {
+            Op::Move(delta) => {
+                pos = shift(pos, *delta as i64);
+                if let Some((lo, hi)) = pos {
+                    if lo < 0 {
+                        warnings.push(format!(
+                            "op {}: pointer may go below 0 (min pos {}); \
+                             future accesses will wrap",
+                            pc, lo
+                        ));
+                    }
+                    if hi >= TAPE_SIZE as i64 {
+                        warnings.push(format!(
+                            "op {}: pointer may exceed tape size {} (max pos {}); \
+                             future accesses will wrap",
+                            pc, TAPE_SIZE, hi
+                        ));
+                    }
+                }
+            }
+
+            Op::Add(off, _)
+            | Op::Sub(off, _)
+            | Op::Clear(off)
+            | Op::Output(off)
+            | Op::Input(off) => {
+                access(pos, *off as i64, &mut warnings);
+            }
+
+            Op::MulLoop { muls, .. } => {
+                access(pos, 0, &mut warnings);
+                for (off, _) in muls {
+                    access(pos, (*off).try_into().unwrap(), &mut warnings);
+                }
+            }
+
+            Op::JumpForward(close) => {
+                loop_entry.push((*close, pos));
+            }
+
+            Op::JumpBack(_) => {
+                if let Some((_, entry_range)) = loop_entry.pop() {
+                    pos = union(pos, entry_range);
+                }
+            }
+
+            Op::ScanRight | Op::ScanLeft => {
+                warnings.push(format!(
+                    "op {}: ScanRight/ScanLeft moves pointer by an unknown amount; \
+                     bounds analysis is conservative past this point",
+                    pc
+                ));
+                pos = None;
+            }
+        }
+    }
+
+    if warnings.is_empty() {
+        println!(
+            "  [bounds]      OK  — pointer stays within [0, {}) on all analysed paths.",
+            TAPE_SIZE
+        );
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        for w in warnings {
+            if seen.insert(w.clone()) {
+                eprintln!("  [bounds]     WARNING: {}", w);
+            }
+        }
+    }
+}
+
+fn run_checks(source: &[u8]) {
+    let brackets_ok = check_brackets(source);
+
+    if brackets_ok {
+        let ops = compile(source);
+        check_unreachable(&ops);
+
+        check_bounds(&ops);
+    } else {
+        println!("  [unreachable] SKIPPED — fix bracket errors first.");
+        println!("  [bounds]     SKIPPED — fix bracket errors first.");
+    }
+}
+
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("error: no input file provided");
-        eprintln!("usage: fastfuck <file>");
-        std::process::exit(1);
-    });
+    let args: Vec<String> = std::env::args().collect();
+
+    let (check_mode, path) = match args.as_slice() {
+        [_, flag, file] if flag == "--check" => (true, file.clone()),
+        [_, file] => (false, file.clone()),
+        _ => {
+            eprintln!("error: no input file provided");
+            eprintln!("usage: fastfuck [--check] <file>");
+            eprintln!();
+            eprintln!("flags:");
+            eprintln!("  --check    Run static analysis without executing");
+            std::process::exit(1);
+        }
+    };
 
     let source = {
-        let file = File::open(&path).unwrap();
+        let file = File::open(&path).unwrap_or_else(|e| {
+            eprintln!("error: cannot open '{}': {}", path, e);
+            std::process::exit(1);
+        });
         let mut reader = BufReader::new(file);
         let mut src = Vec::new();
         reader.read_to_end(&mut src).unwrap();
         src
     };
 
-    let ops = compile(&source);
-    run_jit(&ops);
+    if check_mode {
+        run_checks(&source);
+    } else {
+        let ops = compile(&source);
+        run_jit(&ops);
+    }
 }
