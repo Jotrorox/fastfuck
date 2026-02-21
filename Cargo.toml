@@ -2,13 +2,21 @@
 name = "fastfuck"
 version = "0.1.0"
 edition = "2024"
+description = "A simple brainfuck implementation that aims to be small and fast."
+repository = "https://github.com/jotrorox/fastfuck"
+license = "BSD 2-Clause"
+keywords = ["jit", "brainfuck", "interpreter", "programming-language", "esoteric-language"]
+categories = ["command-line-utilities", "development-tools", "compilers"]
+publish = false
 
 [dependencies]
+cranelift = { version = "0.128.3", features = [ "jit", "module", "native" ] }
 memchr = "2.8.0"
+mimalloc = "0.1.48"
 
 [profile.release]
-opt-level = 3
-lto = "fat"
+opt-level = "z"
+lto = true
 codegen-units = 1
-strip = true
 panic = "abort"
+strip = true
